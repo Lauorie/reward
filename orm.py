@@ -1,23 +1,11 @@
 import os
 import re
-from typing import TYPE_CHECKING, Dict, List, Union, Any
-import logging
-import math
+from typing import TYPE_CHECKING, Dict, List, Union
 
 import json
-import numpy as np
 
 if TYPE_CHECKING:
     from swift.llm import InferRequest
-
-# 添加 VLLM 相关导入
-try:
-    from vllm import LLM, SamplingParams
-    VLLM_AVAILABLE = True
-except ImportError:
-    VLLM_AVAILABLE = False
-    LLM = None
-    SamplingParams = None
 
 
 class ORM:
@@ -313,14 +301,12 @@ class ReActFormat(ORM):
 class CosineReward(ORM):
     # https://arxiv.org/abs/2502.03373
     def __init__(self,
-                 tokenizer=None,
                  cosine_min_len_value_wrong: float = -0.5,
                  cosine_max_len_value_wrong: float = 0.0,
                  cosine_min_len_value_correct: float = 1.0,
                  cosine_max_len_value_correct: float = 0.5,
                  cosine_max_len: int = 1000,
                  accuracy_orm=None):
-        self.tokenizer = tokenizer
         self.min_len_value_wrong = cosine_min_len_value_wrong
         self.max_len_value_wrong = cosine_max_len_value_wrong
         self.min_len_value_correct = cosine_min_len_value_correct
@@ -335,8 +321,9 @@ class CosineReward(ORM):
 
     def __call__(self, completions, solution, **kwargs) -> List[float]:
         acc_rewards = self.accuracy_orm(completions, solution, **kwargs)
+        response_token_ids = kwargs.get('response_token_ids')
         rewards = []
-        for content, acc_reward in zip(completions, acc_rewards):
+        for ids, acc_reward in zip(response_token_ids, acc_rewards):
             is_correct = acc_reward >= 1.
             if is_correct:
                 # Swap min/max for correct answers
@@ -345,7 +332,7 @@ class CosineReward(ORM):
             else:
                 min_value = self.max_len_value_wrong
                 max_value = self.min_len_value_wrong
-            gen_len = len(self.tokenizer.encode(content))
+            gen_len = len(ids)
             reward = self.cosfn(gen_len, self.max_len, min_value, max_value)
             rewards.append(reward)
         return rewards
@@ -392,1089 +379,212 @@ class RepetitionPenalty(ORM):
 
 class SoftOverlong(ORM):
 
-    def __init__(self, tokenizer, soft_max_length, soft_cache_length):
-        self.tokenizer = tokenizer
+    def __init__(self, soft_max_length, soft_cache_length):
         assert soft_cache_length < soft_max_length
         self.soft_max_length = soft_max_length
         self.soft_cache_length = soft_cache_length
 
     def __call__(self, completions, **kwargs) -> List[float]:
         rewards = []
-        for completion in completions:
-            completion_length = len(self.tokenizer.encode(completion))
+        response_token_ids = kwargs.get('response_token_ids')
+        for ids in response_token_ids:
+            completion_length = len(ids)
             expected_len = self.soft_max_length - self.soft_cache_length
             exceed_len = completion_length - expected_len
             rewards.append(min(-exceed_len / self.soft_cache_length, 0))
         return rewards
 
 
-class CompletionLength(ORM):
-    def __init__(self, tokenizer):
-        self.tokenizer = tokenizer
-
-    def __call__(self, completions: List[Any], **kwargs) -> List[float]:
-        rewards = []
-        for completion in completions:
-            completion_length = len(self.tokenizer.encode(completion))
-            if completion_length >= 128 and completion_length <= 768:
-                rewards.append(1.0)
-            else:
-                rewards.append(-1.0)
-        return rewards
-
-
-from collections import Counter
-from typing import List, Any
-
-class VoteAnswer(ORM):
+class BatchRougeL(ORM):
     """
-    以出现次数最多的 completion 作为 gold，
-    对每个 completion 逐一比较：
-        相同 -> 奖励  +1
-        不同 -> 奖励  -1
+    计算每个答案与批次内其他所有completions的平均ROUGE-L F1-score的奖励函数
+    使用tokenizer将文本转换为token ID序列进行计算，更好地支持中文
+    同时结合长度奖励和ROUGE奖励
     """
-    def __call__(self, completions: List[Any], **kwargs) -> List[float]:
-        # 1. 边界情况：空输入
-        if not completions:
-            return []
 
-        # 2. 选出出现次数最多的作为 gold（出现次数并列时取第一次出现的）
-        counts = Counter(completions)
-        most_common_val, most_common_cnt = counts.most_common(1)[0]
-
-        # 如果希望出现次数并列时也严格“投票”，可以启用下面注释的代码：
-        # top_count = most_common_cnt
-        # candidates = [c for c, cnt in counts.items() if cnt == top_count]
-        # most_common_val = candidates[0]  # 取最先出现的
-
-        # 3. 计算奖励
-        rewards = [1.0 if c == most_common_val else 0.0 for c in completions]
-        return rewards
-
-
-from collections import Counter
-from typing import List, Any
-
-class CombinedReward(ORM):
-    """
-    综合奖励函数，结合长度奖励和投票奖励
-    - 长度奖励：completion 长度在 128-768 token 范围内给予奖励
-    - 投票奖励：以出现次数最多的 completion 作为参考给予奖励
-    """
-    def __init__(self, tokenizer, length_weight=0.3, vote_weight=0.7):
-        self.tokenizer = tokenizer
+    def __init__(self, 
+                exclude_self: bool = True, 
+                tokenizer_path: str = None,
+                length_weight: float = 0.5, 
+                rouge_weight: float = 0.5,
+                target_length: int = 512, 
+                tolerance: int = 256):
+        """
+        Args:
+            exclude_self: 是否在计算平均值时排除自身（默认为True）
+            tokenizer_path: tokenizer文件路径，如果为None则尝试使用默认路径
+            length_weight: 长度奖励的权重（默认0.5）
+            rouge_weight: ROUGE奖励的权重（默认0.5）
+            target_length: 目标长度（默认512个token）
+            tolerance: 长度容忍度（默认256个token）
+        """
+        self.exclude_self = exclude_self
         self.length_weight = length_weight
-        self.vote_weight = vote_weight
+        self.rouge_weight = rouge_weight
+        self.target_length = target_length
+        self.tolerance = tolerance
+        self._init_tokenizer_and_scorer(tokenizer_path)
 
-    def __call__(self, completions: List[Any], **kwargs) -> List[float]:
-        # 边界情况：空输入
-        if not completions:
-            return []
+    def _init_tokenizer_and_scorer(self, tokenizer_path):
+        """初始化tokenizer和rouge scorer"""
+        try:
+            from transformers.tokenization_utils_fast import PreTrainedTokenizerFast
+            from rouge_score import rouge_scorer
+            
+            # 尝试多个可能的tokenizer路径
+            possible_paths = [
+                tokenizer_path,
+                "/root/app/Allen2-PaperFinder/src/tokenizer.json",
+                "/opt/models/WisModel-20250906/tokenizer.json",
+            ]
+            
+            self.tokenizer = None
+            for path in possible_paths:
+                if path and os.path.exists(path):
+                    try:
+                        self.tokenizer = PreTrainedTokenizerFast(tokenizer_file=path)
+                        break
+                    except Exception:
+                        continue
+            
+            # 如果没有找到tokenizer，回退到原始方法
+            if self.tokenizer is None:
+                print("Warning: 无法加载tokenizer，将使用原始ROUGE-L计算方法")
+            
+            self.scorer = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=False)
+            
+        except ImportError:
+            print("Warning: 缺少依赖包，将使用原始ROUGE-L计算方法")
+            self.tokenizer = None
+            self.scorer = None
 
-        # 计算长度奖励
-        length_rewards = []
-        for completion in completions:
-            completion_length = len(self.tokenizer.encode(completion))
-            if completion_length >= 128 and completion_length <= 768:
-                length_rewards.append(1.0)
-            else:
-                length_rewards.append(-1.0)
-
-        # 计算投票奖励
-        counts = Counter(completions)
-        most_common_val, most_common_cnt = counts.most_common(1)[0]
-        vote_rewards = [1.0 if c == most_common_val else 0.0 for c in completions]
-
-        # 合并两个奖励
-        combined_rewards = [
-            self.length_weight * length_reward + self.vote_weight * vote_reward
-            for length_reward, vote_reward in zip(length_rewards, vote_rewards)
-        ]
-
-        return combined_rewards
-
-import numpy as np
-from collections import Counter
-from typing import List, Any
-
-class FinalCombinedReward(ORM):
-    """
-    最终修正版的综合奖励函数（适配 GRPO）
-    - 长度奖励：使用平滑的高斯函数，奖励在目标范围内平滑过渡。
-    - 软投票奖励：奖励与得票数成正比，而不是赢者通吃。
-    - **移除了内部的奖励标准化步骤**，将此任务交由 GRPO 算法本身处理。
-    """
-    def __init__(self, tokenizer, length_weight=0.8, vote_weight=0.2):
-        self.tokenizer = tokenizer
-        self.length_weight = length_weight
-        self.vote_weight = vote_weight
-
-        # 定义长度奖励的目标参数
-        self.target_length = (128 + 768) / 2  # 理想中心长度: 448
-        self.tolerance = (768 - 128) / 2    # 长度容忍范围: 320
+    def _tokenize_text(self, text: str) -> str:
+        """使用tokenizer编码为token IDs，然后转换为字符串序列"""
+        if self.tokenizer is None:
+            return text
+        
+        try:
+            token_ids = self.tokenizer.encode(text, add_special_tokens=False)
+            # 将token IDs转换为字符串，用空格分隔
+            return " ".join(map(str, token_ids))
+        except Exception:
+            return text
 
     def _calculate_smooth_length_rewards(self, completions: List[str]) -> List[float]:
-        """计算平滑的长度奖励，使用高斯函数"""
+        """计算长度奖励，使用高斯函数对目标长度进行平滑奖励"""
+        import numpy as np
         rewards = []
         for completion in completions:
-            completion_length = len(self.tokenizer.encode(completion))
+            if self.tokenizer is not None:
+                completion_length = len(self.tokenizer.encode(completion, add_special_tokens=False))
+            else:
+                # 回退方法：简单字符长度估算
+                completion_length = len(completion) // 4  # 粗略估算token数量
+            
+            # 使用高斯函数计算长度奖励
             exponent = -((completion_length - self.target_length) ** 2) / (2 * self.tolerance ** 2)
             reward = np.exp(exponent)
             rewards.append(reward)
         return rewards
 
-    def _calculate_soft_vote_rewards(self, completions: List[str]) -> List[float]:
-        """计算软投票奖励，奖励与票数成正比"""
-        if not completions:
-            return []
-        
-        counts = Counter(completions)
-        if not counts:
-            return [0.0] * len(completions)
-
-        most_common_cnt = counts.most_common(1)[0][1]
-        if most_common_cnt == 0:
-             return [0.0] * len(completions)
-
-        rewards = [counts[c] / most_common_cnt for c in completions]
-        return rewards
-
-    def __call__(self, completions: List[Any], **kwargs) -> List[float]:
-        if not completions:
-            return []
-
-        # 1. 计算各部分奖励
-        length_rewards = self._calculate_smooth_length_rewards(completions)
-        vote_rewards = self._calculate_soft_vote_rewards(completions)
-
-        # 2. 加权合并奖励
-        # 这个 combined_rewards 是一个绝对分数，其值域大约在 [0, 1] 之间
-        # GRPO 将会接收这个列表，并在其内部进行标准化来计算优势
-        combined_rewards = [
-            self.length_weight * lr + self.vote_weight * vr
-            for lr, vr in zip(length_rewards, vote_rewards)
-        ]
-
-        # 直接返回合并后的原始奖励分数，不再进行任何标准化处理
-        return combined_rewards
-
-import numpy as np
-from typing import List, Any
-from rouge_score import rouge_scorer
-
-class RougeReward(ORM):
-    """
-    使用 ROUGE-L 分数作为奖励，替代投票法，以鼓励语义一致性和表达多样性。
-    - 长度奖励：依旧使用平滑的高斯函数。
-    - ROUGE 奖励：计算每个 completion 与批次内其他所有 completions 的平均 ROUGE-L F1-score。
-    """
-    def __init__(self, tokenizer, length_weight=0.5, rouge_weight=0.5):
-        self.tokenizer = tokenizer
-        self.length_weight = length_weight
-        self.rouge_weight = rouge_weight
-        
-        # 初始化 ROUGE scorer
-        self.scorer = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
-
-        # 长度奖励参数
-        self.target_length = (128 + 768) / 2
-        self.tolerance = (768 - 128) / 2
-
-    def _calculate_smooth_length_rewards(self, completions: List[str]) -> List[float]:
-        rewards = []
-        for completion in completions:
-            completion_length = len(self.tokenizer.encode(completion))
-            exponent = -((completion_length - self.target_length) ** 2) / (2 * self.tolerance ** 2)
-            rewards.append(np.exp(exponent))
-        return rewards
-
     def _calculate_rouge_rewards(self, completions: List[str]) -> List[float]:
+        """计算批次内ROUGE-L奖励"""
         if len(completions) <= 1:
-            return [1.0] * len(completions)
-
-        rouge_rewards = []
-        for i, comp_i in enumerate(completions):
-            scores = []
-            for j, comp_j in enumerate(completions):
-                if i == j:
+            return [0.0] * len(completions)
+        
+        rewards = []
+        for i, current_completion in enumerate(completions):
+            rouge_scores = []
+            
+            for j, other_completion in enumerate(completions):
+                if self.exclude_self and i == j:
                     continue
-                # 计算 comp_i 和 comp_j 之间的 ROUGE-L fmeasure
-                score = self.scorer.score(comp_i, comp_j)['rougeL'].fmeasure
-                scores.append(score)
+                    
+                # 计算当前completion与其他completion的ROUGE-L分数
+                rouge_score = self._calculate_rouge_score(current_completion, other_completion)
+                rouge_scores.append(rouge_score)
             
-            # 使用平均分作为这个 completion 的奖励
-            # 如果 scores 为空（只有一个 completion），则奖励为1.0
-            avg_score = np.mean(scores) if scores else 1.0
-            rouge_rewards.append(avg_score)
-            
-        return rouge_rewards
+            # 计算平均ROUGE-L分数
+            if rouge_scores:
+                avg_rouge = sum(rouge_scores) / len(rouge_scores)
+            else:
+                avg_rouge = 0.0
+                
+            rewards.append(avg_rouge)
+        
+        return rewards
 
-    def __call__(self, completions: List[Any], **kwargs) -> List[float]:
+    def _calculate_rouge_score(self, text1: str, text2: str) -> float:
+        """计算两个文本之间的ROUGE-L F1-score"""
+        if self.scorer is None:
+            # 回退到原始方法
+            try:
+                return ReactORM.evaluate_rougel([text1], [text2]) or 0.0
+            except Exception:
+                return 0.0
+        
+        try:
+            # 使用tokenizer处理文本
+            tokenized_text1 = self._tokenize_text(text1)
+            tokenized_text2 = self._tokenize_text(text2)
+            
+            # 计算ROUGE-L F1-score
+            score = self.scorer.score(tokenized_text1, tokenized_text2)['rougeL'].fmeasure
+            return score
+        except Exception:
+            return 0.0
+
+    def __call__(self, completions, solution=None, **kwargs) -> List[float]:
+        """
+        计算结合长度奖励和ROUGE奖励的综合分数
+        
+        Args:
+            completions: 批次内的所有completion数据，可以是：
+                        1. 字符串列表
+                        2. 包含'solution'字段的字典列表：{"messages": [...], "solution": "..."}
+                        3. 包含'messages'的字典列表（旧格式）
+            solution: 可选的solution列表，当completions是字符串列表时使用
+            
+        Returns:
+            每个completion的综合奖励分数列表
+        """
+        # 处理输入格式：从字典中提取文本内容
         if not completions:
             return []
-
-        length_rewards = self._calculate_smooth_length_rewards(completions)
-        rouge_rewards = self._calculate_rouge_rewards(completions)
-
+        
+        # 提取实际的文本内容
+        if isinstance(completions[0], dict):
+            if 'solution' in completions[0]:
+                # 新格式：{"messages": [...], "solution": "..."}
+                text_completions = [item['solution'] for item in completions]
+            elif 'messages' in completions[0]:
+                # 旧格式：从messages中提取assistant回复
+                text_completions = [item['messages'][-1]['content'] for item in completions]
+            else:
+                # 其他字典格式，尝试直接使用
+                text_completions = completions
+        elif isinstance(completions[0], str):
+            # 直接是字符串列表
+            text_completions = completions
+        else:
+            # 其他格式，尝试直接使用
+            text_completions = completions
+        
+        if len(text_completions) <= 1:
+            # 如果批次只有一个或没有completion，返回长度奖励
+            return self._calculate_smooth_length_rewards(text_completions)
+        
+        # 计算长度奖励和ROUGE奖励
+        length_rewards = self._calculate_smooth_length_rewards(text_completions)
+        rouge_rewards = self._calculate_rouge_rewards(text_completions)
+        
+        # 组合两种奖励
         combined_rewards = [
             self.length_weight * lr + self.rouge_weight * rr
             for lr, rr in zip(length_rewards, rouge_rewards)
         ]
         
         return combined_rewards
-
-
-class RougeWithSolutionReward(ORM):
-    """
-    使用 ROUGE-L 分数与数据集solution比较作为奖励，结合长度奖励
-    - 长度奖励：使用平滑的高斯函数，鼓励合适长度的回答
-    - ROUGE 奖励：计算每个 completion 与对应 solution 的 ROUGE-L F1-score
-    
-    与RougeReward的区别：
-    - RougeReward: completion vs 其他completions (批次内多样性)
-    - RougeWithSolutionReward: completion vs solution (与标准答案相似性)
-    """
-    def __init__(self, tokenizer, length_weight=0.4, rouge_weight=0.6):
-        self.tokenizer = tokenizer
-        self.length_weight = length_weight
-        self.rouge_weight = rouge_weight
-        
-        # 初始化 ROUGE scorer
-        try:
-            import rouge_score
-            from rouge_score import rouge_scorer
-            self.scorer = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
-        except ImportError:
-            raise ImportError("请安装rouge_score: pip install rouge-score")
-
-        # 长度奖励参数 - 针对学术问答调整
-        self.target_length = (128 + 768) / 2  # 目标长度448 tokens
-        self.tolerance = (768 - 128) / 2      # 容忍度320 tokens
-        
-        import logging
-        self.logger = logging.getLogger(__name__)
-
-    def _calculate_smooth_length_rewards(self, completions: List[str]) -> List[float]:
-        """
-        计算长度奖励，使用高斯函数，鼓励适中长度的回答
-        """
-        rewards = []
-        for completion in completions:
-            try:
-                # 使用tokenizer编码来获取准确的token长度
-                if hasattr(self.tokenizer, 'encode'):
-                    completion_length = len(self.tokenizer.encode(str(completion), add_special_tokens=False))
-                else:
-                    # fallback: 简单的词汇计数
-                    completion_length = len(str(completion).split())
-                
-                # 高斯函数计算长度奖励
-                exponent = -((completion_length - self.target_length) ** 2) / (2 * self.tolerance ** 2)
-                length_reward = np.exp(exponent)
-                rewards.append(length_reward)
-                
-            except Exception as e:
-                self.logger.warning(f"长度奖励计算失败: {e}")
-                rewards.append(0.5)  # 默认中等奖励
-                
-        return rewards
-
-    def _calculate_rouge_with_solution_rewards(self, completions: List[str], solutions: List[str]) -> List[float]:
-        """
-        计算每个completion与对应solution的ROUGE-L F1-score
-        
-        Args:
-            completions: 生成的回答列表
-            solutions: 对应的标准答案列表
-            
-        Returns:
-            List[float]: ROUGE-L F1分数列表
-        """
-        if not completions or not solutions:
-            return [0.0] * len(completions)
-        
-        rouge_rewards = []
-        
-        # 确保solutions长度匹配
-        if len(solutions) == 1:
-            # 如果只有一个solution，所有completions都与它比较
-            solutions = solutions * len(completions)
-        elif len(solutions) != len(completions):
-            self.logger.warning(
-                f"Completions 和 Solutions 列表长度不匹配！"
-                f"({len(completions)} vs {len(solutions)}). "
-                f"将进行广播或截断，但这可能表示数据管道存在问题。"
-            )
-            # 长度不匹配时，截断或填充
-            if len(solutions) < len(completions):
-                solutions = solutions + [solutions[-1]] * (len(completions) - len(solutions))
-            else:
-                solutions = solutions[:len(completions)]
-        
-        for i, completion in enumerate(completions):
-            try:
-                solution = solutions[i] if i < len(solutions) else solutions[0]
-                
-                # 计算ROUGE-L F1-score
-                completion_str = str(completion).strip()
-                solution_str = str(solution).strip()
-                
-                if not completion_str or not solution_str:
-                    rouge_rewards.append(0.0)
-                    continue
-                
-                # 使用ROUGE scorer计算分数
-                score = self.scorer.score(solution_str, completion_str)['rougeL'].fmeasure
-                rouge_rewards.append(score)
-                
-            except Exception as e:
-                self.logger.warning(f"ROUGE计算失败: {e}")
-                rouge_rewards.append(0.0)
-        
-        return rouge_rewards
-
-    def __call__(self, completions: List[Any], solution: List[str] = None, **kwargs) -> List[float]:
-        """
-        计算结合ROUGE-L和长度的奖励
-        
-        Args:
-            completions: 生成的完成文本列表
-            solution: 标准答案列表
-            **kwargs: 其他参数，可能包含solutions、solution等
-            
-        Returns:
-            List[float]: 奖励值列表
-        """
-        if not completions:
-            return []
-        
-        # 从kwargs中获取解答数据
-        solutions = solution or kwargs.get('solutions') or kwargs.get('solution') or []
-        
-        # 如果没有提供solutions，使用基于长度的奖励
-        if not solutions:
-            self.logger.warning("RougeWithSolutionReward: 没有提供solution，仅使用长度奖励")
-            return self._calculate_smooth_length_rewards(completions)
-        
-        # 计算长度奖励
-        length_rewards = self._calculate_smooth_length_rewards(completions)
-        
-        # 计算ROUGE奖励
-        rouge_rewards = self._calculate_rouge_with_solution_rewards(completions, solutions)
-        
-        # 组合奖励
-        combined_rewards = [
-            self.length_weight * lr + self.rouge_weight * rr
-            for lr, rr in zip(length_rewards, rouge_rewards)
-        ]
-        
-        # 记录调试信息
-        if len(completions) <= 5:  # 避免日志过多
-            for i, (comp, sol, lr, rr, cr) in enumerate(zip(
-                completions[:5], solutions[:5], 
-                length_rewards[:5], rouge_rewards[:5], combined_rewards[:5]
-            )):
-                self.logger.info(f"奖励计算 {i+1}: 长度={lr:.3f}, ROUGE={rr:.3f}, 总计={cr:.3f}")
-        
-        return combined_rewards
-
-import numpy as np
-from collections import Counter
-from typing import List, Any
-
-class DecisiveReward(ORM):
-    """
-    一个更具决定性的奖励函数，结合了：
-    1. 锐利的梯形长度奖励 (Sharp Trapezoidal Length Reward)
-    2. ROUGE-L 内容相似度奖励 (ROUGE-L Content Similarity)
-    3. N-gram 重复惩罚 (N-gram Repetition Penalty)
-    """
-    def __init__(self, 
-                 tokenizer, 
-                 length_weight: float = 0.2, 
-                 rouge_weight: float = 0.7,
-                 penalty_weight: float = 0.1):
-        """
-        初始化奖励函数
-        
-        Args:
-            tokenizer: 用于计算token长度的分词器
-            length_weight (float): 长度奖励的权重
-            rouge_weight (float): ROUGE分数的权重
-            penalty_weight (float): 重复惩罚的权重 (注意是负向奖励)
-        """
-        self.tokenizer = tokenizer
-        self.length_weight = length_weight
-        self.rouge_weight = rouge_weight
-        self.penalty_weight = penalty_weight
-        
-        # 初始化 ROUGE scorer
-        try:
-            from rouge_score import rouge_scorer
-            self.scorer = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
-        except ImportError:
-            raise ImportError("请安装rouge_score: pip install rouge-score")
-
-        # 1. 梯形长度奖励参数 (更严格)
-        self.penalty_zone_min = 128      # 惩罚区下限 (低于此值奖励开始下降)
-        self.optimal_zone_min = 256      # 最优区下限 (在此之上奖励为1.0)
-        self.optimal_zone_max = 512      # 最优区上限 (在此之下奖励为1.0)
-        self.penalty_zone_max = 768      # 惩罚区上限 (高于此值奖励开始下降)
-        
-        import logging
-        self.logger = logging.getLogger(__name__)
-        self.logger.info(f"DecisiveReward 初始化: "
-                         f"length_weight={self.length_weight}, "
-                         f"rouge_weight={self.rouge_weight}, "
-                         f"penalty_weight={self.penalty_weight}")
-        self.logger.info(f"长度奖励区间: 惩罚区=[{self.penalty_zone_min}, {self.penalty_zone_max}], "
-                         f"最优区=[{self.optimal_zone_min}, {self.optimal_zone_max}]")
-
-
-    def _calculate_trapezoidal_length_rewards(self, completions: List[str]) -> List[float]:
-        """计算梯形长度奖励，提供清晰的梯度信号"""
-        rewards = []
-        for comp in completions:
-            try:
-                length = len(self.tokenizer.encode(str(comp), add_special_tokens=False))
-                
-                if self.optimal_zone_min <= length <= self.optimal_zone_max:
-                    # 在最优区间内，奖励为1.0
-                    reward = 1.0
-                elif self.penalty_zone_min <= length < self.optimal_zone_min:
-                    # 在下行惩罚坡道，奖励线性增加
-                    reward = (length - self.penalty_zone_min) / (self.optimal_zone_min - self.penalty_zone_min)
-                elif self.optimal_zone_max < length <= self.penalty_zone_max:
-                    # 在上行惩罚坡道，奖励线性减少
-                    reward = (self.penalty_zone_max - length) / (self.penalty_zone_max - self.optimal_zone_max)
-                else:
-                    # 在最优区间外，奖励为0
-                    reward = 0.0
-                rewards.append(reward)
-            except Exception as e:
-                self.logger.warning(f"梯形长度奖励计算失败: {e}")
-                rewards.append(0.0) # 失败时给予0分
-        return rewards
-
-    def _calculate_repetition_penalties(self, completions: List[str], n: int = 4) -> List[float]:
-        """计算n-gram重复惩罚。返回值是惩罚力度(0到1)，越高表示重复越严重"""
-        penalties = []
-        for comp in completions:
-            try:
-                tokens = self.tokenizer.encode(str(comp), add_special_tokens=False)
-                if len(tokens) < n:
-                    penalties.append(0.0)
-                    continue
-                
-                ngrams = [tuple(tokens[i:i+n]) for i in range(len(tokens) - n + 1)]
-                if not ngrams:
-                    penalties.append(0.0)
-                    continue
-                
-                ngram_counts = Counter(ngrams)
-                # 计算重复率：(总n-gram数 - 独立n-gram数) / 总n-gram数
-                repetition_ratio = (len(ngrams) - len(ngram_counts)) / len(ngrams)
-                penalties.append(repetition_ratio)
-            except Exception as e:
-                self.logger.warning(f"重复惩罚计算失败: {e}")
-                penalties.append(0.5) # 失败时给予中等惩罚
-        return penalties
-
-    # _calculate_rouge_with_solution_rewards 方法可以从您之前的代码中直接复用，无需修改
-    def _calculate_rouge_with_solution_rewards(self, completions: List[str], solutions: List[str]) -> List[float]:
-        # ... (将您之前的实现粘贴到这里) ...
-        if not completions or not solutions:
-            return [0.0] * len(completions)
-        rouge_rewards = []
-        if len(solutions) == 1:
-            solutions = solutions * len(completions)
-        elif len(solutions) != len(completions):
-            self.logger.warning(f"Completions和Solutions长度不匹配: {len(completions)} vs {len(solutions)}")
-            if len(solutions) < len(completions):
-                solutions = solutions + [solutions[-1]] * (len(completions) - len(solutions))
-            else:
-                solutions = solutions[:len(completions)]
-        for i, completion in enumerate(completions):
-            try:
-                solution = solutions[i]
-                completion_str, solution_str = str(completion).strip(), str(solution).strip()
-                if not completion_str or not solution_str:
-                    rouge_rewards.append(0.0)
-                    continue
-                score = self.scorer.score(target=completion_str, reference=solution_str)['rougeL'].fmeasure
-                rouge_rewards.append(score)
-            except Exception as e:
-                self.logger.warning(f"ROUGE计算失败: {e}")
-                rouge_rewards.append(0.0)
-        return rouge_rewards
-
-
-    def __call__(self, completions: List[Any], solution: List[str] = None, **kwargs) -> List[float]:
-        if not completions:
-            return []
-        
-        solutions = solution or kwargs.get('solutions') or kwargs.get('solution') or []
-        
-        if not solutions:
-            self.logger.warning("DecisiveReward: 未提供solution，仅使用长度奖励和重复惩罚")
-            length_rewards = self._calculate_trapezoidal_length_rewards(completions)
-            repetition_penalties = self._calculate_repetition_penalties(completions)
-            return [self.length_weight * lr - self.penalty_weight * rp 
-                    for lr, rp in zip(length_rewards, repetition_penalties)]
-
-        # 计算所有奖励分量
-        length_rewards = self._calculate_trapezoidal_length_rewards(completions)
-        rouge_rewards = self._calculate_rouge_with_solution_rewards(completions, solutions)
-        repetition_penalties = self._calculate_repetition_penalties(completions)
-        
-        # 组合奖励 (注意惩罚是减去的)
-        combined_rewards = [
-            self.length_weight * lr + self.rouge_weight * rr - self.penalty_weight * rp
-            for lr, rr, rp in zip(length_rewards, rouge_rewards, repetition_penalties)
-        ]
-        
-        # 记录调试信息
-        if len(completions) > 0:
-            self.logger.info(
-                f"奖励样本: "
-                f"长度R={length_rewards[0]:.3f}, "
-                f"ROUGE_R={rouge_rewards[0]:.3f}, "
-                f"重复P={repetition_penalties[0]:.3f}, "
-                f"总计R={combined_rewards[0]:.3f}"
-            )
-        
-        return combined_rewards
-
-class RLPRReward(ORM):
-    """
-    RLPR (Reinforcement Learning from Preference Ranking) 奖励函数
-    基于生成响应对参考答案概率影响的奖励机制
-    
-    核心思想：
-    - 计算 r_generated = P(reference_answer | question + generated_response)
-    - 计算 r_reference = P(reference_answer | question)  
-    - 奖励基于比值 r_generated / r_reference
-    """
-    
-    def __init__(self, 
-                 tokenizer,
-                 beta: float = 0.5,
-                 system_message: str = "你是源语奇思（AtomInfinite）开发的人工智能助手 WisModel。",
-                 min_logprob_clamp: float = -20.0,
-                 max_logprob_penalty: float = 5.0,
-                 model: str = None,  # 匹配训练参数中的model字段
-                 use_vllm: bool = True,
-                 ema_decay: float = 0.9,
-                 vllm_gpu_memory_utilization: float = 0.5,
-                 vllm_max_model_len: int = 8800,
-                 vllm_tensor_parallel_size: int = 1,
-                 include_length_reward: bool = True,  # 是否包含长度奖励
-                 length_weight: float = 0.3,  # 长度奖励权重
-                 rlpr_weight: float = 0.7,  # RLPR奖励权重
-                 **vllm_kwargs):
-        """
-        初始化RLPR奖励函数
-        
-        Args:
-            tokenizer: 用于文本编码的tokenizer
-            beta: RLPR的平衡参数
-            system_message: 系统消息前缀
-            min_logprob_clamp: 最小log概率截断值
-            max_logprob_penalty: 最大log概率惩罚
-            model: 模型路径（用于VLLM，匹配训练参数）
-            use_vllm: 是否使用VLLM进行概率计算
-            ema_decay: EMA衰减率
-            vllm_gpu_memory_utilization: VLLM GPU内存利用率
-            vllm_max_model_len: VLLM最大模型长度
-            vllm_tensor_parallel_size: VLLM张量并行大小
-            include_length_reward: 是否包含长度奖励（使用高斯函数）
-            length_weight: 长度奖励的权重
-            rlpr_weight: RLPR奖励的权重
-            **vllm_kwargs: 传递给VLLM的额外参数
-        """
-        self.tokenizer = tokenizer
-        self.beta = beta
-        self.system_message = system_message
-        self.min_logprob_clamp = min_logprob_clamp
-        self.max_logprob_penalty = max_logprob_penalty
-        self.model_path = model  # 保持内部使用model_path变量名
-        self.use_vllm = use_vllm and VLLM_AVAILABLE
-        self.ema_decay = ema_decay
-        self.include_length_reward = include_length_reward
-        self.length_weight = length_weight
-        self.rlpr_weight = rlpr_weight
-        self.std_ema = None
-        self.logger = logging.getLogger(__name__)
-        
-        # 如果启用VLLM且可用，初始化VLLM模型
-        self.llm = None
-        if self.use_vllm and model:
-            try:
-                # 设置vLLM默认参数，使用训练参数
-                default_vllm_kwargs = {
-                    "tensor_parallel_size": vllm_tensor_parallel_size,
-                    "dtype": "auto", 
-                    "trust_remote_code": True,
-                    "gpu_memory_utilization": vllm_gpu_memory_utilization,
-                    "max_model_len": vllm_max_model_len,
-                }
-                default_vllm_kwargs.update(vllm_kwargs)
-                
-                self.logger.info("正在加载vLLM模型用于RLPR奖励计算...")
-                self.llm = LLM(model=model, **default_vllm_kwargs)
-                self.logger.info("vLLM模型加载完成！")
-            except Exception as e:
-                self.logger.warning(f"VLLM初始化失败，回退到简化模式: {e}")
-                self.use_vllm = False
-                self.llm = None
-        
-    def _get_prompt_prefix(self, messages: List[Dict]) -> str:
-        """使用tokenizer的chat template格式化messages"""
-        if not messages:
-            # 如果没有messages，使用默认格式
-            default_messages = [
-                {"role": "system", "content": self.system_message},
-                {"role": "user", "content": ""}
-            ]
-            messages = default_messages
-        
-        try:
-            # 使用tokenizer的apply_chat_template方法
-            if hasattr(self.tokenizer, 'apply_chat_template'):
-                return self.tokenizer.apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=True
-                )
-            else:
-                # fallback：手动格式化
-                return self._manual_format_messages(messages)
-        except Exception as e:
-            self.logger.warning(f"使用chat_template失败，回退到手动格式化: {e}")
-            return self._manual_format_messages(messages)
-    
-    def _manual_format_messages(self, messages: List[Dict]) -> str:
-        """手动格式化messages（fallback方法）"""
-        conversation_parts = []
-        for message in messages:
-            role = message.get('role', '')
-            content = message.get('content', '')
-            
-            if role == 'system':
-                conversation_parts.append(content)
-            elif role == 'user':
-                conversation_parts.append(f"用户: {content}")
-            elif role == 'assistant':
-                conversation_parts.append(f"助手: {content}")
-        
-        # 拼接所有对话部分，添加最终的回答提示
-        full_conversation = "\n\n".join(conversation_parts)
-        if full_conversation:
-            full_conversation += "\n\n助手: "
-        
-        return full_conversation
-    
-    def _safe_encode_text(self, text: str) -> List[int]:
-        """安全地编码文本为token IDs"""
-        try:
-            if hasattr(self.tokenizer, 'encode'):
-                return self.tokenizer.encode(text, add_special_tokens=False)
-            elif hasattr(self.tokenizer, '__call__'):
-                return self.tokenizer(text)['input_ids']
-            else:
-                self.logger.warning("Tokenizer没有encode方法，返回空列表")
-                return []
-        except Exception as e:
-            self.logger.warning(f"文本编码失败: {e}")
-            return []
-    
-    def _calculate_mean_probability_vllm(self, prefix_text: str, target_text: str) -> float:
-        """
-        使用vLLM计算目标文本在给定前缀条件下的平均token概率
-        """
-        try:
-            # 分别编码前缀和目标
-            prefix_ids = self._safe_encode_text(prefix_text)
-            target_ids = self._safe_encode_text(target_text)
-
-            if not target_ids:
-                return 0.0
-
-            # 构建完整序列：[prefix + target]
-            full_sequence = prefix_ids + target_ids
-            full_text = self.tokenizer.decode(full_sequence, skip_special_tokens=False)
-            
-            # 使用vLLM计算完整序列的logprobs
-            sampling_params = SamplingParams(
-                temperature=0.7,  
-                max_tokens=1,  # 只生成一个token
-                logprobs=1,  # 获取logprobs
-                prompt_logprobs=True,  # 关键：获取prompt的logprobs
-                seed=42
-            )
-            
-            outputs = self.llm.generate([full_text], sampling_params)
-            output = outputs[0]
-            
-            # 获取prompt的logprobs（即完整序列的logprobs）
-            if output.prompt_logprobs:
-                prompt_logprobs = output.prompt_logprobs
-                
-                # 计算目标部分的概率
-                target_start_pos = len(prefix_ids)
-                target_end_pos = target_start_pos + len(target_ids)
-                
-                # 提取目标部分的logprobs
-                target_logprobs = []
-                for i in range(target_start_pos, min(target_end_pos, len(prompt_logprobs))):
-                    if i < len(prompt_logprobs) and prompt_logprobs[i]:
-                        # 获取实际目标token的logprob
-                        target_token_id = target_ids[i - target_start_pos]
-                        if target_token_id in prompt_logprobs[i]:
-                            target_logprobs.append(prompt_logprobs[i][target_token_id].logprob)
-                        else:
-                            # 如果找不到确切的token，使用最小的logprob作为惩罚
-                            min_logprob = min(lp.logprob for lp in prompt_logprobs[i].values())
-                            target_logprobs.append(min_logprob - 5.0)  # 额外惩罚
-                
-                if target_logprobs:
-                    # 转换为概率并计算平均值
-                    probabilities = [math.exp(max(lp, -20.0)) for lp in target_logprobs]  # 限制最小值避免下溢
-                    mean_prob = np.mean(probabilities)
-                    return float(mean_prob)
-                        
-            return 0.0
-
-        except Exception as e:
-            self.logger.warning(f"vLLM概率计算失败: {e}")
-            return 0.0
-
-    def _calculate_smooth_length_reward(self, completion_text: str) -> float:
-        """
-        使用高斯函数计算平滑的长度奖励，参考RougeReward的实现
-        """
-        try:
-            completion_length = len(self._safe_encode_text(completion_text))
-            
-            # 使用与RougeReward相同的参数设置
-            target_length = (128 + 768) / 2  # 448
-            tolerance = (768 - 128) / 2  # 320
-            
-            # 高斯函数：exp(-((x - μ)^2) / (2σ^2))
-            exponent = -((completion_length - target_length) ** 2) / (2 * tolerance ** 2)
-            length_reward = math.exp(exponent)
-            
-            return float(length_reward)
-            
-        except Exception as e:
-            self.logger.warning(f"长度奖励计算失败: {e}")
-            return 0.5  # 返回中等奖励作为默认值
-
-    def _calculate_mean_probability_vllm(self, prefix_text: str, target_text: str, trainer=None) -> float:
-        """
-        智能概率计算 - 基于文本语义相似性的启发式方法
-        由于Swift vLLM接口复杂，使用语义相似性来近似概率计算
-        """
-        try:
-            # 计算基于文本相似性的概率近似
-            return self._calculate_semantic_probability(prefix_text, target_text)
-            
-        except Exception as e:
-            self.logger.warning(f"语义概率计算失败: {e}")
-            return self._calculate_mean_probability_fallback(prefix_text, target_text)
-
-    def _calculate_semantic_probability(self, prefix_text: str, target_text: str) -> float:
-        """
-        基于语义相似性的智能概率计算
-        分析前缀文本和目标文本的语义关联性
-        """
-        try:
-            # 1. 长度因子：较短的目标文本概率更高
-            target_ids = self._safe_encode_text(target_text)
-            if not target_ids:
-                return 0.0
-            
-            length_factor = min(1.0, 100.0 / max(len(target_ids), 1))
-            
-            # 2. 词汇重叠度：计算共同词汇比例
-            prefix_words = set(prefix_text.lower().split())
-            target_words = set(target_text.lower().split()) 
-            
-            if len(target_words) > 0:
-                overlap_ratio = len(prefix_words & target_words) / len(target_words)
-            else:
-                overlap_ratio = 0.0
-            
-            # 3. 位置相关性：检查目标文本是否是前缀的自然延续
-            context_relevance = self._calculate_context_relevance(prefix_text, target_text)
-            
-            # 4. 语言流畅性：基于n-gram估算
-            fluency_score = self._calculate_fluency_score(prefix_text, target_text)
-            
-            # 综合计算概率
-            semantic_prob = (
-                length_factor * 0.3 + 
-                overlap_ratio * 0.25 + 
-                context_relevance * 0.25 + 
-                fluency_score * 0.2
-            )
-            
-            # 确保在合理范围内
-            return max(0.001, min(0.999, semantic_prob))
-            
-        except Exception as e:
-            self.logger.warning(f"语义概率计算失败: {e}")
-            return 0.1
-
-    def _calculate_context_relevance(self, prefix_text: str, target_text: str) -> float:
-        """计算上下文相关性"""
-        try:
-            # 检查目标文本是否包含问题相关的关键词
-            prefix_lower = prefix_text.lower()
-            target_lower = target_text.lower()
-            
-            # 如果前缀包含问题标识，目标应该是回答
-            if any(keyword in prefix_lower for keyword in ['问题', '问:', 'question', '?', '？']):
-                # 检查目标是否包含回答性词汇
-                if any(keyword in target_lower for keyword in ['是', '有', '可以', '会', '能够', 'yes', 'no', 'the', 'it']):
-                    return 0.8
-                return 0.4
-            
-            # 检查逻辑连贯性
-            if target_lower.startswith(tuple(['因为', '由于', 'because', 'since'])):
-                return 0.7
-            if target_lower.startswith(tuple(['所以', '因此', 'therefore', 'so'])):
-                return 0.6
-                
-            return 0.5
-            
-        except:
-            return 0.5
-
-    def _calculate_fluency_score(self, prefix_text: str, target_text: str) -> float:
-        """计算语言流畅性分数"""
-        try:
-            # 简单的流畅性检查
-            if not target_text.strip():
-                return 0.0
-                
-            # 检查是否有完整的句子结构
-            if any(target_text.strip().endswith(punct) for punct in ['.', '。', '!', '！', '?', '？']):
-                fluency = 0.8
-            else:
-                fluency = 0.5
-                
-            # 避免重复词汇
-            words = target_text.split()
-            if len(words) > 1:
-                unique_ratio = len(set(words)) / len(words)
-                fluency *= unique_ratio
-                
-            return min(1.0, fluency)
-            
-        except:
-            return 0.5
-    
-    def _calculate_mean_probability_fallback(self, prefix_text: str, target_text: str) -> float:
-        """
-        简化版的概率计算，作为fallback方法
-        """
-        try:
-            # 编码文本
-            prefix_ids = self._safe_encode_text(prefix_text)
-            target_ids = self._safe_encode_text(target_text)
-            
-            if not target_ids:
-                return 0.0
-            
-            # 基于文本长度和复杂度的启发式估计
-            length_factor = min(1.0, 50.0 / max(len(target_ids), 1))
-            
-            # 考虑前缀和目标文本的相似性
-            prefix_text_lower = prefix_text.lower()
-            target_text_lower = target_text.lower()
-            
-            # 简单的文本相似性度量
-            common_words = set(prefix_text_lower.split()) & set(target_text_lower.split())
-            similarity = len(common_words) / max(len(target_text_lower.split()), 1)
-            
-            # 结合长度因子和相似性
-            probability = length_factor * 0.7 + similarity * 0.3
-            
-            return max(0.001, min(0.999, probability))  # 确保在合理范围内
-            
-        except Exception as e:
-            self.logger.warning(f"Fallback概率计算失败: {e}")
-            return 0.1  # 返回一个默认的小概率值
-    
-    def _compute_single_reward(self, messages: List[Dict], generated_response: str, reference_answer: str, trainer_state=None) -> float:
-        """
-        计算单个样本的RLPR奖励
-        
-        Args:
-            messages: 对话历史消息列表
-            generated_response: 生成的响应
-            reference_answer: 参考答案
-            trainer_state: 训练器状态（可选）
-            
-        Returns:
-            float: 奖励值 [0, 1]
-        """
-        if not messages or not generated_response.strip() or not reference_answer.strip():
-            return 0.0
-            
-        try:
-            prompt_prefix = self._get_prompt_prefix(messages)
-            
-            # 计算概率 - 根据是否有VLLM选择不同的计算方法
-            context_with_generated = prompt_prefix + generated_response
-            if self.use_vllm and self.llm:
-                r_generated = self._calculate_mean_probability_vllm(context_with_generated, reference_answer)
-                r_reference = self._calculate_mean_probability_vllm(prompt_prefix, reference_answer)
-            else:
-                r_generated = self._calculate_mean_probability_simple(context_with_generated, reference_answer, trainer_state)
-                r_reference = self._calculate_mean_probability_simple(prompt_prefix, reference_answer, trainer_state)
-            
-            # 计算RLPR奖励
-            if r_reference > 0:
-                ratio = r_generated / r_reference
-                if ratio >= 1.0:
-                    rlpr_reward = 0.5 + (ratio - 1.0) * 0.5
-                else:
-                    rlpr_reward = ratio * 0.5
-            else:
-                rlpr_reward = r_generated
-                
-            # 确保在[0,1]范围内
-            rlpr_reward = np.clip(rlpr_reward, 0.0, 1.0)
-            
-            # 如果启用长度奖励，计算组合奖励
-            if self.include_length_reward:
-                length_reward = self._calculate_smooth_length_reward(generated_response)
-                final_reward = self.rlpr_weight * rlpr_reward + self.length_weight * length_reward
-            else:
-                final_reward = rlpr_reward
-            
-            # 确保最终奖励在[0,1]范围内
-            final_reward = np.clip(final_reward, 0.0, 1.0)
-            
-            return float(final_reward)
-            
-        except Exception as e:
-            self.logger.error(f"RLPR奖励计算失败: {e}")
-            return 0.0
-    
-
-    
-    def __call__(self, completions: List[Any], solution: List[str] = None, **kwargs) -> List[float]:
-        """
-        计算RLPR奖励
-        
-        Args:
-            completions: 生成的完成文本列表
-            solution: 参考答案列表（如果提供）
-            **kwargs: 其他参数，可能包含trainer_state、messages等
-            
-        Returns:
-            List[float]: 奖励值列表
-        """
-        if not completions:
-            return []
-        
-        rewards = []
-        trainer_state = kwargs.get('trainer_state')
-        
-        # 从kwargs中获取数据
-        trainer = kwargs.get('trainer')  # 获取训练器实例
-        solutions = solution or kwargs.get('solutions') or kwargs.get('solution') or []
-        messages_list = kwargs.get('messages') or []
-        
-        # 如果没有提供messages或解答，使用基于高斯函数的长度奖励作为备用策略
-        if not messages_list or not solutions:
-            # 对于缺少必要信息的情况，使用基于高斯函数的长度奖励
-            self.logger.warning(f"RLPR: 缺少messages或参考答案，使用基于高斯函数的长度奖励策略。messages: {len(messages_list)}, solutions: {len(solutions)}")
-            for completion in completions:
-                # 使用高斯函数计算长度奖励
-                reward = self._calculate_smooth_length_reward(str(completion))
-                rewards.append(reward)
-            return rewards
-        
-        # 确保所有列表长度一致
-        num_samples = len(completions)
-        if len(messages_list) == 1:
-            messages_list = messages_list * num_samples
-        if len(solutions) == 1:
-            solutions = solutions * num_samples
-            
-        messages_list = messages_list[:num_samples]
-        solutions = solutions[:num_samples]
-        
-        # 计算每个样本的RLPR奖励
-        for i, completion in enumerate(completions):
-            messages = messages_list[i] if i < len(messages_list) else []
-            solution = solutions[i] if i < len(solutions) else ""
-            
-            reward = self._compute_single_reward_vllm(
-                messages=messages,
-                generated_response=str(completion),
-                reference_answer=str(solution),
-                trainer=trainer
-            )
-            rewards.append(reward)
-        
-        return rewards
-
-    def _compute_single_reward_vllm(self, messages: List[Dict], generated_response: str, reference_answer: str, trainer=None) -> float:
-        """
-        使用vLLM计算单个样本的RLPR奖励 - 参考rlpr_vllm.py的实现
-        
-        Args:
-            messages: 对话历史消息列表
-            generated_response: 生成的响应
-            reference_answer: 参考答案
-            trainer: 训练器实例（用于访问vLLM引擎）
-            
-        Returns:
-            float: 奖励值 [0, 1]
-        """
-        if not messages or not generated_response.strip() or not reference_answer.strip():
-            return 0.0
-            
-        try:
-            prompt_prefix = self._get_prompt_prefix(messages)
-            
-            # 计算概率 - 使用真正的vLLM计算
-            context_with_generated = prompt_prefix + generated_response
-            r_generated = self._calculate_mean_probability_vllm(context_with_generated, reference_answer, trainer)
-            r_reference = self._calculate_mean_probability_vllm(prompt_prefix, reference_answer, trainer)
-            
-            # 使用与rlpr_vllm.py相同的奖励计算逻辑
-            if r_reference > 0:
-                ratio = r_generated / r_reference
-                # 将比例转换为合理的奖励范围
-                if ratio >= 1.0:
-                    reward = 0.5 + (ratio - 1.0) * 0.5  # 比例>1时奖励>0.5
-                else:
-                    reward = ratio * 0.5  # 比例<1时奖励<0.5
-            else:
-                reward = r_generated
-                
-            # 确保在[0,1]范围内
-            reward = np.clip(reward, 0.0, 1.0)
-            
-            return float(reward)
-            
-        except Exception as e:
-            self.logger.error(f"RLPR vLLM奖励计算失败: {e}")
-            # fallback到基于长度的奖励
-            try:
-                completion_length = len(self._safe_encode_text(generated_response))
-                if 50 <= completion_length <= 500:
-                    return 0.8
-                else:
-                    return 0.3
-            except:
-                return 0.5
 
 
 orms = {
@@ -1486,12 +596,5 @@ orms = {
     'cosine': CosineReward,
     'repetition': RepetitionPenalty,
     'soft_overlong': SoftOverlong,
-    'vote_answer': VoteAnswer,
-    'completionlength': CompletionLength,
-    'CombinedReward': CombinedReward,
-    'FinalCombinedReward': FinalCombinedReward,
-    "RougeReward": RougeReward,
-    "RougeWithSolutionReward": RougeWithSolutionReward,
-    "RLPRReward": RLPRReward,
-    "DecisiveReward": DecisiveReward
+    'batch_rouge_l': BatchRougeL,
 }
